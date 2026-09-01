@@ -153,86 +153,69 @@ def fetch_wufeng_live_features(df_history=None):
     except Exception as e:
         print(f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}")
 
-    # (C) 國道 3 號車流量 (已修正：1. 正確子目錄路徑 2. 探測延遲 3. 防火牆表頭與備用機制)
-    v_2100N, v_2100S, v_2125N, v_2129S = 450.0, 480.0, 320.0, 310.0
+    # (C) 國道 3 號車流量 (附帶 Streamlit 偵錯 Log 紀錄)
+    v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     now = datetime.datetime.now()
-
-    # Worker 代理（若直接請求被擋，會自動改走 Worker）
     WORKER_PROXY = "https://steep-wood-cf94.4b432104.workers.dev/?url="
+    
+    # 建立一個 list 用來記錄 Streamlit 要顯示的 Debug 訊息
+    traffic_logs = []
+    traffic_logs.append(f"🔍 [Debug] 開始診斷國道車流抓取，當前系統時間: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
     try:
         traffic_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*"
         }
         latest_base_time = None
 
-        # 往前推算 10 ~ 40 分鐘，尋找高公局伺服器上最新已產生的 5 分鐘 CSV 檔案
+        # 1. 探測高公局最新的 CSV 檔案時間
         for offset_min in range(10, 45, 5):
             probe_time = now - datetime.timedelta(minutes=offset_min)
-            check_time = probe_time.replace(
-                minute=(probe_time.minute // 5) * 5, second=0, microsecond=0
-            )
+            check_time = probe_time.replace(minute=(probe_time.minute // 5) * 5, second=0, microsecond=0)
             ymd = check_time.strftime("%Y%m%d")
             hh = check_time.strftime("%H")
             mm = check_time.strftime("%M")
-
-            # ✅ 修正：包含 /YYYYMMDD/HH/ 子目錄
+            
             raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+            proxy_url = f"{WORKER_PROXY}{raw_url}"
+            
+            traffic_logs.append(f"📡 嘗試探測時間點 {ymd} {hh}:{mm} ...")
 
-            # 先嘗試直連，若失敗則走 Worker 代理
-            for try_url in [raw_url, f"{WORKER_PROXY}{raw_url}"]:
+            # 先試直連，再試 Worker
+            for mode, try_url in [("直連", raw_url), ("Worker代理", proxy_url)]:
                 try:
-                    res_check = requests.get(
-                        try_url,
-                        headers=traffic_headers,
-                        timeout=4,
-                        verify=False,
-                    )
-                    if res_check.status_code == 200 and len(res_check.text) > 100:
+                    resp = requests.get(try_url, headers=traffic_headers, timeout=4, verify=False)
+                    traffic_logs.append(f"   -> [{mode}] HTTP 狀態碼: {resp.status_code}, 回傳長度: {len(resp.text)} bytes")
+                    if resp.status_code == 200 and len(resp.text) > 100:
                         latest_base_time = check_time
-                        print(
-                            f"   [3/3] 🎯 找到高公局最新車流檔案時間點:"
-                            f" {ymd} {hh}:{mm}"
-                        )
+                        traffic_logs.append(f"   ✅ 成功找到最新可用的 CSV 時間點: {ymd} {hh}:{mm} (使用 {mode})")
                         break
-                except Exception:
-                    continue
-
+                except Exception as ex:
+                    traffic_logs.append(f"   ❌ [{mode}] 請求失敗: {ex}")
+            
             if latest_base_time:
                 break
 
-        # 抓取該時間點前 12 份 5 分鐘 CSV 檔案（累計為 1 小時車流量）
+        # 2. 如果找到最新時間，抓取前 12 份 (共 1 小時) 並統計門架車流
         if latest_base_time:
-            hourly_vol = {
-                "03F2100N": 0.0,
-                "03F2100S": 0.0,
-                "03F2125N": 0.0,
-                "03F2129S": 0.0,
-            }
+            hourly_vol = {"03F2100N": 0.0, "03F2100S": 0.0, "03F2125N": 0.0, "03F2129S": 0.0}
             success_count = 0
+            total_raw_rows = 0
 
             for i in range(11, -1, -1):
-                target_time = latest_base_time - datetime.timedelta(minutes=i * 5)
+                target_time = latest_base_time - datetime.timedelta(minutes=i*5)
                 ymd = target_time.strftime("%Y%m%d")
                 hh = target_time.strftime("%H")
                 mm = target_time.strftime("%M")
-
+                
                 raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+                proxy_url = f"{WORKER_PROXY}{raw_url}"
 
-                # 先嘗試直連，失敗再走 Proxy
                 res_csv = None
-                for try_url in [raw_url, f"{WORKER_PROXY}{raw_url}"]:
+                for try_url in [raw_url, proxy_url]:
                     try:
-                        resp = requests.get(
-                            try_url,
-                            headers=traffic_headers,
-                            timeout=4,
-                            verify=False,
-                        )
+                        resp = requests.get(try_url, headers=traffic_headers, timeout=4, verify=False)
                         if resp.status_code == 200 and len(resp.text) > 100:
                             res_csv = resp
                             break
@@ -241,33 +224,44 @@ def fetch_wufeng_live_features(df_history=None):
 
                 if res_csv:
                     success_count += 1
-                    for line in res_csv.text.strip().split("\n"):
+                    lines = res_csv.text.strip().split("\n")
+                    total_raw_rows += len(lines)
+                    
+                    matched_in_file = 0
+                    for line in lines:
                         parts = line.split(",")
-                        if len(parts) >= 5 and parts[1].strip() in hourly_vol:
-                            hourly_vol[parts[1].strip()] += float(
-                                parts[4].strip()
-                            )
+                        if len(parts) >= 5:
+                            gantry_id = parts[1].strip()
+                            vehicle_cnt = parts[4].strip()
+                            if gantry_id in hourly_vol:
+                                try:
+                                    hourly_vol[gantry_id] += float(vehicle_cnt)
+                                    matched_in_file += 1
+                                except ValueError:
+                                    pass
+                    traffic_logs.append(f"   📄 CSV ({hh}:{mm}): 讀取 {len(lines)} 行，命中目標門架 {matched_in_file} 次")
+
+            traffic_logs.append(f"📊 總計成功下載 {success_count}/12 份檔案，共掃描 {total_raw_rows} 行資料。")
+            traffic_logs.append(f"🔢 原始加總結果: {hourly_vol}")
 
             if success_count > 0:
-                # 若抓到的檔案少於 12 份，依照抓到的比例等比放大至一小時流量
                 scale_factor = 12.0 / success_count
                 v_2100N = hourly_vol["03F2100N"] * scale_factor
                 v_2100S = hourly_vol["03F2100S"] * scale_factor
                 v_2125N = hourly_vol["03F2125N"] * scale_factor
                 v_2129S = hourly_vol["03F2129S"] * scale_factor
-                print(
-                    f"   [3/3] ✅ 成功解析 {success_count}/12 份車流 CSV 數據"
-                    f" (03F2100N: {v_2100N:.0f}, 03F2100S: {v_2100S:.0f},"
-                    f" 03F2125N: {v_2125N:.0f}, 03F2129S: {v_2129S:.0f})"
-                )
+                traffic_logs.append(f"🧮 依成功比例 ({success_count}/12) 縮放後總計: 2100N={v_2100N:.0f}, 2100S={v_2100S:.0f}, 2125N={v_2125N:.0f}, 2129S={v_2129S:.0f}")
             else:
-                print("   [3/3] ⚠️ 車流檔案內容為空，採用歷史保底車流量")
+                traffic_logs.append("⚠️ 沒有成功下載到任何一份 CSV 檔案！")
         else:
-            print("   [3/3] ⚠️ 未能找到高公局可用的最新 CSV 檔，採用保底車流量")
+            traffic_logs.append("❌ 探測失敗，找不到任何可用的高公局 CSV 檔案。")
 
     except Exception as e:
-        print(f"   [3/3] ℹ️ 車流抓取例外: {e}，採用保底車流量")
+        traffic_logs.append(f"💥 發生未預期的例外錯誤: {e}")
 
+    # 印出至控制台
+    for log in traffic_logs:
+        print(log)
     # (D) 動態計算一階差分與二階加速度
     last_pm25 = (
         float(df_history["pm25"].iloc[-1])
