@@ -153,43 +153,59 @@ def fetch_wufeng_live_features(df_history=None):
     except Exception as e:
         print(f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}")
 
-    # (C) 國道 3 號車流量 (透過 Cloudflare Worker 代理繞過海外 IP 封鎖)
+    # (C) 國道 3 號車流量 (已修正：1. 正確子目錄路徑 2. 探測延遲 3. 防火牆表頭與備用機制)
     v_2100N, v_2100S, v_2125N, v_2129S = 450.0, 480.0, 320.0, 310.0
-    WORKER_PROXY = "https://steep-wood-cf94.4b432104.workers.dev/?url="
     now = datetime.datetime.now()
+
+    # Worker 代理（若直接請求被擋，會自動改走 Worker）
+    WORKER_PROXY = "https://steep-wood-cf94.4b432104.workers.dev/?url="
 
     try:
         traffic_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
         }
         latest_base_time = None
 
-        # 探測最新可用的 CSV 檔
-        for offset_min in range(0, 30, 5):
+        # 往前推算 10 ~ 40 分鐘，尋找高公局伺服器上最新已產生的 5 分鐘 CSV 檔案
+        for offset_min in range(10, 45, 5):
             probe_time = now - datetime.timedelta(minutes=offset_min)
             check_time = probe_time.replace(
                 minute=(probe_time.minute // 5) * 5, second=0, microsecond=0
             )
-            ymd, hh, mm = (
-                check_time.strftime("%Y%m%d"),
-                check_time.strftime("%H"),
-                check_time.strftime("%M"),
-            )
+            ymd = check_time.strftime("%Y%m%d")
+            hh = check_time.strftime("%H")
+            mm = check_time.strftime("%M")
+
+            # ✅ 修正：包含 /YYYYMMDD/HH/ 子目錄
             raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-            proxy_url = f"{WORKER_PROXY}{raw_url}"
 
-            try:
-                # 透過 Worker 代理進行 GET 檢查
-                res_check = requests.get(
-                    proxy_url, headers=traffic_headers, timeout=5, verify=False
-                )
-                if res_check.status_code == 200:
-                    latest_base_time = check_time
-                    break
-            except Exception:
-                continue
+            # 先嘗試直連，若失敗則走 Worker 代理
+            for try_url in [raw_url, f"{WORKER_PROXY}{raw_url}"]:
+                try:
+                    res_check = requests.get(
+                        try_url,
+                        headers=traffic_headers,
+                        timeout=4,
+                        verify=False,
+                    )
+                    if res_check.status_code == 200 and len(res_check.text) > 100:
+                        latest_base_time = check_time
+                        print(
+                            f"   [3/3] 🎯 找到高公局最新車流檔案時間點:"
+                            f" {ymd} {hh}:{mm}"
+                        )
+                        break
+                except Exception:
+                    continue
 
-        # 抓取該整點前 12 份 5 分鐘 CSV 檔
+            if latest_base_time:
+                break
+
+        # 抓取該時間點前 12 份 5 分鐘 CSV 檔案（累計為 1 小時車流量）
         if latest_base_time:
             hourly_vol = {
                 "03F2100N": 0.0,
@@ -198,44 +214,59 @@ def fetch_wufeng_live_features(df_history=None):
                 "03F2129S": 0.0,
             }
             success_count = 0
+
             for i in range(11, -1, -1):
                 target_time = latest_base_time - datetime.timedelta(minutes=i * 5)
-                ymd, hh, mm = (
-                    target_time.strftime("%Y%m%d"),
-                    target_time.strftime("%H"),
-                    target_time.strftime("%M"),
-                )
-                raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-                proxy_url = f"{WORKER_PROXY}{raw_url}"
+                ymd = target_time.strftime("%Y%m%d")
+                hh = target_time.strftime("%H")
+                mm = target_time.strftime("%M")
 
-                try:
-                    res_csv = requests.get(
-                        proxy_url,
-                        headers=traffic_headers,
-                        timeout=5,
-                        verify=False,
-                    )
-                    if res_csv.status_code == 200:
-                        success_count += 1
-                        for line in res_csv.text.strip().split("\n"):
-                            parts = line.split(",")
-                            if len(parts) >= 5 and parts[1].strip() in hourly_vol:
-                                hourly_vol[parts[1].strip()] += float(parts[4].strip())
-                except Exception:
-                    continue
+                raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+
+                # 先嘗試直連，失敗再走 Proxy
+                res_csv = None
+                for try_url in [raw_url, f"{WORKER_PROXY}{raw_url}"]:
+                    try:
+                        resp = requests.get(
+                            try_url,
+                            headers=traffic_headers,
+                            timeout=4,
+                            verify=False,
+                        )
+                        if resp.status_code == 200 and len(resp.text) > 100:
+                            res_csv = resp
+                            break
+                    except Exception:
+                        continue
+
+                if res_csv:
+                    success_count += 1
+                    for line in res_csv.text.strip().split("\n"):
+                        parts = line.split(",")
+                        if len(parts) >= 5 and parts[1].strip() in hourly_vol:
+                            hourly_vol[parts[1].strip()] += float(
+                                parts[4].strip()
+                            )
 
             if success_count > 0:
+                # 若抓到的檔案少於 12 份，依照抓到的比例等比放大至一小時流量
                 scale_factor = 12.0 / success_count
                 v_2100N = hourly_vol["03F2100N"] * scale_factor
                 v_2100S = hourly_vol["03F2100S"] * scale_factor
                 v_2125N = hourly_vol["03F2125N"] * scale_factor
                 v_2129S = hourly_vol["03F2129S"] * scale_factor
                 print(
-                    f"   [3/3] ✅ 成功經由 Cloudflare 代理解析 {success_count}/12"
-                    " 份車流 CSV 數據"
+                    f"   [3/3] ✅ 成功解析 {success_count}/12 份車流 CSV 數據"
+                    f" (03F2100N: {v_2100N:.0f}, 03F2100S: {v_2100S:.0f},"
+                    f" 03F2125N: {v_2125N:.0f}, 03F2129S: {v_2129S:.0f})"
                 )
+            else:
+                print("   [3/3] ⚠️ 車流檔案內容為空，採用歷史保底車流量")
+        else:
+            print("   [3/3] ⚠️ 未能找到高公局可用的最新 CSV 檔，採用保底車流量")
+
     except Exception as e:
-        print(f"   [3/3] ℹ️ 車流代理抓取跳過: {e}")
+        print(f"   [3/3] ℹ️ 車流抓取例外: {e}，採用保底車流量")
 
     # (D) 動態計算一階差分與二階加速度
     last_pm25 = (
