@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.preprocessing import StandardScaler  # 🔧 修正：改用 StandardScaler
+from sklearn.preprocessing import StandardScaler  # 🔧 改用 StandardScaler
 import torch
 import torch.nn as nn
 
@@ -153,16 +153,18 @@ def fetch_wufeng_live_features(df_history=None):
     except Exception as e:
         print(f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}")
 
-    # (C) 國道 3 號車流量
+    # (C) 國道 3 號車流量 (透過 Cloudflare Worker 代理繞過海外 IP 封鎖)
     v_2100N, v_2100S, v_2125N, v_2129S = 450.0, 480.0, 320.0, 310.0
+    WORKER_PROXY = "https://steep-wood-cf94.4b432104.workers.dev/?url="
     now = datetime.datetime.now()
+
     try:
         traffic_headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-            "Host": "tisvcloud.freeway.gov.tw",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         latest_base_time = None
+
+        # 探測最新可用的 CSV 檔
         for offset_min in range(0, 30, 5):
             probe_time = now - datetime.timedelta(minutes=offset_min)
             check_time = probe_time.replace(
@@ -173,10 +175,13 @@ def fetch_wufeng_live_features(df_history=None):
                 check_time.strftime("%H"),
                 check_time.strftime("%M"),
             )
-            url_check = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+            raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+            proxy_url = f"{WORKER_PROXY}{raw_url}"
+
             try:
-                res_check = requests.head(
-                    url_check, headers=traffic_headers, timeout=2, verify=False
+                # 透過 Worker 代理進行 GET 檢查
+                res_check = requests.get(
+                    proxy_url, headers=traffic_headers, timeout=5, verify=False
                 )
                 if res_check.status_code == 200:
                     latest_base_time = check_time
@@ -184,6 +189,7 @@ def fetch_wufeng_live_features(df_history=None):
             except Exception:
                 continue
 
+        # 抓取該整點前 12 份 5 分鐘 CSV 檔
         if latest_base_time:
             hourly_vol = {
                 "03F2100N": 0.0,
@@ -193,33 +199,28 @@ def fetch_wufeng_live_features(df_history=None):
             }
             success_count = 0
             for i in range(11, -1, -1):
-                target_time = latest_base_time - datetime.timedelta(
-                    minutes=i * 5
-                )
+                target_time = latest_base_time - datetime.timedelta(minutes=i * 5)
                 ymd, hh, mm = (
                     target_time.strftime("%Y%m%d"),
                     target_time.strftime("%H"),
                     target_time.strftime("%M"),
                 )
-                url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+                raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+                proxy_url = f"{WORKER_PROXY}{raw_url}"
+
                 try:
                     res_csv = requests.get(
-                        url_csv,
+                        proxy_url,
                         headers=traffic_headers,
-                        timeout=3,
+                        timeout=5,
                         verify=False,
                     )
                     if res_csv.status_code == 200:
                         success_count += 1
                         for line in res_csv.text.strip().split("\n"):
                             parts = line.split(",")
-                            if (
-                                len(parts) >= 5
-                                and parts[1].strip() in hourly_vol
-                            ):
-                                hourly_vol[parts[1].strip()] += float(
-                                    parts[4].strip()
-                                )
+                            if len(parts) >= 5 and parts[1].strip() in hourly_vol:
+                                hourly_vol[parts[1].strip()] += float(parts[4].strip())
                 except Exception:
                     continue
 
@@ -230,11 +231,11 @@ def fetch_wufeng_live_features(df_history=None):
                 v_2125N = hourly_vol["03F2125N"] * scale_factor
                 v_2129S = hourly_vol["03F2129S"] * scale_factor
                 print(
-                    f"   [3/3] ✅ 成功自動探測最新 CSV，解析 {success_count}/12"
-                    " 份檔加總車流"
+                    f"   [3/3] ✅ 成功經由 Cloudflare 代理解析 {success_count}/12"
+                    " 份車流 CSV 數據"
                 )
     except Exception as e:
-        print(f"   [3/3] ℹ️ M03A CSV 自動探測跳過: {e}")
+        print(f"   [3/3] ℹ️ 車流代理抓取跳過: {e}")
 
     # (D) 動態計算一階差分與二階加速度
     last_pm25 = (
@@ -341,7 +342,7 @@ def main():
     ]
     target_col = "pm25"
 
-    # 🔧 修正 1：改用 StandardScaler，與訓練腳本一致
+    # 🔧 改用 StandardScaler，與訓練腳本一致
     scaler_X = StandardScaler().fit(df_history[feature_cols])
     scaler_y = StandardScaler().fit(df_history[[target_col]])
 
@@ -389,11 +390,11 @@ def main():
     with torch.no_grad():
         preds_delta_scaled = model(input_tensor).cpu().numpy()[0]
 
-    # 🔧 修正 2：殘差加回邏輯 (基準點 scaled y + 變化量 Δy_scaled)
+    # 殘差加回邏輯 (基準點 scaled y + 變化量 Δy_scaled)
     base_pm25_scaled = window_scaled[-1, 6]  # 特徵第 6 欄位是 pm25
     pred_y_scaled = base_pm25_scaled + preds_delta_scaled
 
-    # 🔧 修正 3：正確使用 scaler_y 進行反還原
+    # 正確使用 scaler_y 進行反還原
     preds_pm25 = scaler_y.inverse_transform(
         pred_y_scaled.reshape(-1, 1)
     ).flatten()
@@ -402,7 +403,7 @@ def main():
     print("\n==================================================")
     print("📊 【霧峰區未來 24 小時 PM2.5 預測趨勢報告】")
     print("==================================================")
-    
+
     # 讀取 SQLite 資料庫中前一小時的實測數值
     prev_pm25_val = "無資料"
     try:
@@ -427,10 +428,10 @@ def main():
         future_time = base_time + datetime.timedelta(hours=i + 1)
         target_time_str = future_time.strftime("%Y-%m-%d %H:00")
         pred_val = max(0.0, float(pred))
-        
+
         # 傳遞 (target_time_str, pred_val, step_index)
         predictions_to_db.append((target_time_str, pred_val, i + 1))
-        
+
         print(
             f" +{i+1:02d} 小時 ({future_time.strftime('%m/%d %H:%M')})  --> "
             f" {pred_val:.2f} µg/m³"
