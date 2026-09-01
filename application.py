@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.preprocessing import StandardScaler  # 🔧 改用 StandardScaler
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 
@@ -48,13 +48,18 @@ class AttentionMultiStepLSTM(nn.Module):
         return out
 
 
-# 2. 自動化擷取【霧峰區】即時 17 項特徵
+# 2. 自動化擷取【霧峰區】即時 17 項特徵 (含偵錯 Log 回傳)
 def fetch_wufeng_live_features(df_history=None):
-    print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...")
+    debug_logs = []
+    now = datetime.datetime.now()
+    debug_logs.append(f"🔍 [Debug] 開始執行即時數據擷取任務，系統時間: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
     }
 
     # (A) 霧峰 PM2.5
@@ -75,13 +80,12 @@ def fetch_wufeng_live_features(df_history=None):
                 val_str = all_cells[idx + 1]
                 if val_str.isdigit() or re.match(r"^\d+(\.\d+)?$", val_str):
                     pm25 = float(val_str)
-                    print(
-                        f"   [1/3] ✅ 精準解析成功！【臺中環保局】霧峰站即時"
-                        f" PM2.5: {pm25} µg/m³"
+                    debug_logs.append(
+                        f"   [1/3] ✅ 【臺中環保局】霧峰站即時 PM2.5 成功解析: {pm25} µg/m³"
                     )
                     break
     except Exception as e:
-        print(f"   [1/3] ℹ️ 網頁爬取跳過: {e}")
+        debug_logs.append(f"   [1/3] ℹ️ 臺中環保局網頁爬取跳過/失敗: {e}")
 
     if pm25 is None:
         try:
@@ -98,12 +102,11 @@ def fetch_wufeng_live_features(df_history=None):
                 val = recs[0].get("pm25") or recs[0].get("pm2.5")
                 if val:
                     pm25 = float(val)
-                    print(
-                        "   [1/3] ✅ 採用鄰近【大里標準站】即時 PM2.5:"
-                        f" {pm25} µg/m³"
+                    debug_logs.append(
+                        f"   [1/3] ✅ 採用鄰近【大里標準站】即時 PM2.5: {pm25} µg/m³"
                     )
-        except Exception:
-            pass
+        except Exception as e:
+            debug_logs.append(f"   [1/3] ℹ️ 大里站 API 跳過: {e}")
 
     if pm25 is None:
         pm25 = (
@@ -111,7 +114,7 @@ def fetch_wufeng_live_features(df_history=None):
             if df_history is not None
             else 15.0
         )
-        print(f"   [1/3] ℹ️ 採用歷史最新/保底 PM2.5 數值: {pm25} µg/m³")
+        debug_logs.append(f"   [1/3] ⚠️ PM2.5 採用歷史/保底數值: {pm25} µg/m³")
 
     # (B) 霧峰氣象
     press, temp, rh, wind_spd, wind_dir, rain = 995.0, 25.0, 75.0, 1.5, 180.0, 0.0
@@ -146,76 +149,88 @@ def fetch_wufeng_live_features(df_history=None):
             if "Now" in station_elem and isinstance(station_elem["Now"], dict):
                 rain = safe_float(station_elem["Now"].get("Precipitation"), 0.0)
 
-            print(
-                f"   [2/3] ✅ 成功取得【氣象署霧峰站】氣象 (觀測時間:"
-                f" {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%, 氣壓 {press}hPa"
+            debug_logs.append(
+                f"   [2/3] ✅ 成功取得【氣象署霧峰站】 (時間: {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%, 氣壓 {press}hPa"
             )
     except Exception as e:
-        print(f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}")
+        debug_logs.append(f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}")
 
-    # (C) 國道 3 號車流量 (附帶 Streamlit 偵錯 Log 紀錄)
+    # (C) 國道 3 號車流量 (含完整除錯診斷與全車種累加)
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
-    now = datetime.datetime.now()
     WORKER_PROXY = "https://steep-wood-cf94.4b432104.workers.dev/?url="
-    
-    # 建立一個 list 用來記錄 Streamlit 要顯示的 Debug 訊息
-    traffic_logs = []
-    traffic_logs.append(f"🔍 [Debug] 開始診斷國道車流抓取，當前系統時間: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
     try:
         traffic_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
         }
         latest_base_time = None
 
-        # 1. 探測高公局最新的 CSV 檔案時間
+        debug_logs.append("🚗 [車流探測] 開始向高公局伺服器探測最新 5 分鐘 CSV 車流檔案...")
+
+        # 往前推算 10 ~ 40 分鐘，尋找高公局伺服器上已產生的 CSV
         for offset_min in range(10, 45, 5):
             probe_time = now - datetime.timedelta(minutes=offset_min)
-            check_time = probe_time.replace(minute=(probe_time.minute // 5) * 5, second=0, microsecond=0)
+            check_time = probe_time.replace(
+                minute=(probe_time.minute // 5) * 5, second=0, microsecond=0
+            )
             ymd = check_time.strftime("%Y%m%d")
             hh = check_time.strftime("%H")
             mm = check_time.strftime("%M")
-            
+
             raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
             proxy_url = f"{WORKER_PROXY}{raw_url}"
-            
-            traffic_logs.append(f"📡 嘗試探測時間點 {ymd} {hh}:{mm} ...")
 
-            # 先試直連，再試 Worker
+            debug_logs.append(f"   📡 測試時間點 {ymd} {hh}:{mm} ...")
+
             for mode, try_url in [("直連", raw_url), ("Worker代理", proxy_url)]:
                 try:
-                    resp = requests.get(try_url, headers=traffic_headers, timeout=4, verify=False)
-                    traffic_logs.append(f"   -> [{mode}] HTTP 狀態碼: {resp.status_code}, 回傳長度: {len(resp.text)} bytes")
-                    if resp.status_code == 200 and len(resp.text) > 100:
+                    res_check = requests.get(
+                        try_url, headers=traffic_headers, timeout=4, verify=False
+                    )
+                    debug_logs.append(
+                        f"      -> [{mode}] HTTP Response Status: {res_check.status_code}, Body Length: {len(res_check.text)} bytes"
+                    )
+                    if res_check.status_code == 200 and len(res_check.text) > 100:
                         latest_base_time = check_time
-                        traffic_logs.append(f"   ✅ 成功找到最新可用的 CSV 時間點: {ymd} {hh}:{mm} (使用 {mode})")
+                        debug_logs.append(
+                            f"   🎯 成功定位高公局最新車流 CSV 時間點: {ymd} {hh}:{mm} (管道: {mode})"
+                        )
                         break
                 except Exception as ex:
-                    traffic_logs.append(f"   ❌ [{mode}] 請求失敗: {ex}")
-            
+                    debug_logs.append(f"      ❌ [{mode}] 連線異常: {ex}")
+
             if latest_base_time:
                 break
 
-        # 2. 如果找到最新時間，抓取前 12 份 (共 1 小時) 並統計門架車流
         if latest_base_time:
-            hourly_vol = {"03F2100N": 0.0, "03F2100S": 0.0, "03F2125N": 0.0, "03F2129S": 0.0}
+            hourly_vol = {
+                "03F2100N": 0.0,
+                "03F2100S": 0.0,
+                "03F2125N": 0.0,
+                "03F2129S": 0.0,
+            }
             success_count = 0
-            total_raw_rows = 0
+            total_lines_scanned = 0
 
             for i in range(11, -1, -1):
-                target_time = latest_base_time - datetime.timedelta(minutes=i*5)
+                target_time = latest_base_time - datetime.timedelta(minutes=i * 5)
                 ymd = target_time.strftime("%Y%m%d")
                 hh = target_time.strftime("%H")
                 mm = target_time.strftime("%M")
-                
+
                 raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
                 proxy_url = f"{WORKER_PROXY}{raw_url}"
 
                 res_csv = None
                 for try_url in [raw_url, proxy_url]:
                     try:
-                        resp = requests.get(try_url, headers=traffic_headers, timeout=4, verify=False)
+                        resp = requests.get(
+                            try_url, headers=traffic_headers, timeout=4, verify=False
+                        )
                         if resp.status_code == 200 and len(resp.text) > 100:
                             res_csv = resp
                             break
@@ -225,9 +240,9 @@ def fetch_wufeng_live_features(df_history=None):
                 if res_csv:
                     success_count += 1
                     lines = res_csv.text.strip().split("\n")
-                    total_raw_rows += len(lines)
-                    
+                    total_lines_scanned += len(lines)
                     matched_in_file = 0
+
                     for line in lines:
                         parts = line.split(",")
                         if len(parts) >= 5:
@@ -235,14 +250,19 @@ def fetch_wufeng_live_features(df_history=None):
                             vehicle_cnt = parts[4].strip()
                             if gantry_id in hourly_vol:
                                 try:
+                                    # 累加所有車種流量
                                     hourly_vol[gantry_id] += float(vehicle_cnt)
                                     matched_in_file += 1
                                 except ValueError:
                                     pass
-                    traffic_logs.append(f"   📄 CSV ({hh}:{mm}): 讀取 {len(lines)} 行，命中目標門架 {matched_in_file} 次")
+                    debug_logs.append(
+                        f"   📄 [CSV {hh}:{mm}] 讀取 {len(lines)} 行，匹配霧峰段門架 {matched_in_file} 次"
+                    )
 
-            traffic_logs.append(f"📊 總計成功下載 {success_count}/12 份檔案，共掃描 {total_raw_rows} 行資料。")
-            traffic_logs.append(f"🔢 原始加總結果: {hourly_vol}")
+            debug_logs.append(
+                f"📊 累計下載成功 {success_count}/12 份 CSV 檔，共掃描 {total_lines_scanned} 行資料。"
+            )
+            debug_logs.append(f"🔢 各門架原始實測總量 (車輛數): {hourly_vol}")
 
             if success_count > 0:
                 scale_factor = 12.0 / success_count
@@ -250,18 +270,20 @@ def fetch_wufeng_live_features(df_history=None):
                 v_2100S = hourly_vol["03F2100S"] * scale_factor
                 v_2125N = hourly_vol["03F2125N"] * scale_factor
                 v_2129S = hourly_vol["03F2129S"] * scale_factor
-                traffic_logs.append(f"🧮 依成功比例 ({success_count}/12) 縮放後總計: 2100N={v_2100N:.0f}, 2100S={v_2100S:.0f}, 2125N={v_2125N:.0f}, 2129S={v_2129S:.0f}")
+                debug_logs.append(
+                    f"   [3/3] ✅ 車流計算完成 (等比換算一小時): 2100N={v_2100N:.0f}, 2100S={v_2100S:.0f}, 2125N={v_2125N:.0f}, 2129S={v_2129S:.0f}"
+                )
             else:
-                traffic_logs.append("⚠️ 沒有成功下載到任何一份 CSV 檔案！")
+                v_2100N, v_2100S, v_2125N, v_2129S = 2200.0, 2400.0, 1800.0, 1700.0
+                debug_logs.append("⚠️ 車輛 CSV 解析結果為空，使用白天真實保底流量數值")
         else:
-            traffic_logs.append("❌ 探測失敗，找不到任何可用的高公局 CSV 檔案。")
+            v_2100N, v_2100S, v_2125N, v_2129S = 2200.0, 2400.0, 1800.0, 1700.0
+            debug_logs.append("❌ 無法抓取高公局 CSV 檔，採用保底預設車流量")
 
     except Exception as e:
-        traffic_logs.append(f"💥 發生未預期的例外錯誤: {e}")
+        v_2100N, v_2100S, v_2125N, v_2129S = 2200.0, 2400.0, 1800.0, 1700.0
+        debug_logs.append(f"   [3/3] ℹ️ 車流抓取過程發生例外: {e}，切換保底數據")
 
-    # 印出至控制台
-    for log in traffic_logs:
-        print(log)
     # (D) 動態計算一階差分與二階加速度
     last_pm25 = (
         float(df_history["pm25"].iloc[-1])
@@ -297,7 +319,7 @@ def fetch_wufeng_live_features(df_history=None):
     hour_sin = np.sin(2 * np.pi * now.hour / 24.0)
     hour_cos = np.cos(2 * np.pi * now.hour / 24.0)
 
-    return [
+    features = [
         press,
         temp,
         rh,
@@ -317,15 +339,16 @@ def fetch_wufeng_live_features(df_history=None):
         hour_cos,
     ]
 
+    return features, debug_logs
 
-# 3. 主推論程式
+
+# 3. 主推論程式 (供獨立 CLI 執行使用)
 def main():
     print("==================================================")
-    print("🚀 啟動【霧峰 PM2.5 未來 24 小時 Attention 多步預測系統 (17 特徵版)】")
+    print("🚀 啟動【霧峰 PM2.5 未來 24 小時 Attention 多步預測系統】")
     print("==================================================")
 
     db_manager.init_db()
-
     df_history = pd.read_csv("dataset_for_lstm.csv")
 
     df_history["dt"] = pd.to_datetime(
@@ -367,24 +390,20 @@ def main():
     ]
     target_col = "pm25"
 
-    # 🔧 改用 StandardScaler，與訓練腳本一致
     scaler_X = StandardScaler().fit(df_history[feature_cols])
     scaler_y = StandardScaler().fit(df_history[[target_col]])
 
-    live_features = fetch_wufeng_live_features(df_history)
-    live_features_list = [float(x) for x in live_features]
+    live_features, logs = fetch_wufeng_live_features(df_history)
+    for log in logs:
+        print(log)
 
-    # 時間歸一化（去除分鐘數，對齊整點）
+    live_features_list = [float(x) for x in live_features]
     now = datetime.datetime.now()
     base_time = now.replace(minute=0, second=0, microsecond=0)
     current_time_str = base_time.strftime("%Y-%m-%d %H:00")
-    prev_time_str = (base_time - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:00")
 
-    # 1. 將當前實測寫入 DB
     db_manager.save_real_data(current_time_str, live_features_list)
-    print(f"💾 已將當前時間點 ({current_time_str}) 實測資料存入 SQLite 資料庫")
 
-    # 2. 特徵準備與推論
     recent_23 = df_history[feature_cols].iloc[-23:].values
     current_window = np.vstack(
         [recent_23, np.array(live_features_list, dtype=np.float32)]
@@ -405,66 +424,28 @@ def main():
     ).to(device)
 
     model_path = "best_lstm_model.pth"
-    if not os.path.exists(model_path):
-        print(f"❌ 錯誤：找不到訓練好的權重檔 '{model_path}'！")
-        sys.exit(1)
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
 
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
+        with torch.no_grad():
+            preds_delta_scaled = model(input_tensor).cpu().numpy()[0]
 
-    with torch.no_grad():
-        preds_delta_scaled = model(input_tensor).cpu().numpy()[0]
+        base_pm25_scaled = window_scaled[-1, 6]
+        pred_y_scaled = base_pm25_scaled + preds_delta_scaled
+        preds_pm25 = scaler_y.inverse_transform(
+            pred_y_scaled.reshape(-1, 1)
+        ).flatten()
 
-    # 殘差加回邏輯 (基準點 scaled y + 變化量 Δy_scaled)
-    base_pm25_scaled = window_scaled[-1, 6]  # 特徵第 6 欄位是 pm25
-    pred_y_scaled = base_pm25_scaled + preds_delta_scaled
+        predictions_to_db = []
+        for i, pred in enumerate(preds_pm25):
+            future_time = base_time + datetime.timedelta(hours=i + 1)
+            target_time_str = future_time.strftime("%Y-%m-%d %H:00")
+            pred_val = max(0.0, float(pred))
+            predictions_to_db.append((target_time_str, pred_val, i + 1))
 
-    # 正確使用 scaler_y 進行反還原
-    preds_pm25 = scaler_y.inverse_transform(
-        pred_y_scaled.reshape(-1, 1)
-    ).flatten()
-
-    predictions_to_db = []
-    print("\n==================================================")
-    print("📊 【霧峰區未來 24 小時 PM2.5 預測趨勢報告】")
-    print("==================================================")
-
-    # 讀取 SQLite 資料庫中前一小時的實測數值
-    prev_pm25_val = "無資料"
-    try:
-        import sqlite3
-        conn = sqlite3.connect("prediction.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT pm25 FROM real_data WHERE timestamp = ?", (prev_time_str,))
-        row = cursor.fetchone()
-        if row:
-            prev_pm25_val = f"{row[0]:.1f} µg/m³"
-        conn.close()
-    except Exception:
-        pass
-
-    print(f"• 上一小時實測 ({prev_time_str}) : {prev_pm25_val}")
-    print(f"• 當前基準時間                    : {current_time_str}")
-    print(f"• 當前實測 PM2.5                   : {live_features_list[6]:.1f} µg/m³\n")
-    print(" 時間預測點               預測 PM2.5 (µg/m³)")
-    print("--------------------------------------------------")
-
-    for i, pred in enumerate(preds_pm25):
-        future_time = base_time + datetime.timedelta(hours=i + 1)
-        target_time_str = future_time.strftime("%Y-%m-%d %H:00")
-        pred_val = max(0.0, float(pred))
-
-        # 傳遞 (target_time_str, pred_val, step_index)
-        predictions_to_db.append((target_time_str, pred_val, i + 1))
-
-        print(
-            f" +{i+1:02d} 小時 ({future_time.strftime('%m/%d %H:%M')})  --> "
-            f" {pred_val:.2f} µg/m³"
-        )
-
-    db_manager.save_predictions(current_time_str, predictions_to_db)
-    print("==================================================")
-    print("💾 已將未來 24 小時預測值同步紀錄至 SQLite 資料庫！")
+        db_manager.save_predictions(current_time_str, predictions_to_db)
+        print("💾 已成功將預測數值寫入 SQLite 資料庫")
 
 
 if __name__ == "__main__":
