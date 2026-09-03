@@ -91,7 +91,7 @@ def fetch_m03a_traffic_from_freeway():
 
         # 嘗試 Worker 代理
         try:
-            r_proxy = session.get(proxy_url, timeout=5, verify=False)
+            r_proxy = session.get(proxy_url, timeout=6, verify=False)
             if r_proxy.status_code == 200 and len(r_proxy.text) > 300:
                 debug_logs.append(f"-> [Worker代理] Response 200 OK, Body Length: {len(r_proxy.text)} bytes")
                 latest_valid_dt = test_dt
@@ -135,32 +135,37 @@ def fetch_m03a_traffic_from_freeway():
         raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
         target_url = f"{CF_PROXY_URL}/?url={raw_url}" if latest_channel == "Worker代理" else raw_url
 
-        try:
-            resp = session.get(target_url, timeout=8, verify=False)
-            if resp.status_code == 200 and len(resp.text) > 100:
-                csv_data = io.StringIO(resp.text)
-                df_temp = pd.read_csv(csv_data, header=None, dtype=str)
+        # 加入最多 2 次重試機制，且 timeout 加長至 12 秒
+        for retry in range(2):
+            try:
+                resp = session.get(target_url, timeout=12, verify=False)
+                if resp.status_code == 200 and len(resp.text) > 100:
+                    csv_data = io.StringIO(resp.text)
+                    df_temp = pd.read_csv(csv_data, header=None, dtype=str)
 
-                if len(df_temp.columns) >= 5:
-                    df_temp[1] = df_temp[1].str.strip()
-                    df_temp[4] = pd.to_numeric(df_temp[4], errors="coerce").fillna(0)
+                    if len(df_temp.columns) >= 5:
+                        df_temp[1] = df_temp[1].str.strip()
+                        df_temp[4] = pd.to_numeric(df_temp[4], errors="coerce").fillna(0)
 
-                    row_count = len(df_temp)
-                    total_rows_scanned += row_count
-                    match_count = 0
+                        row_count = len(df_temp)
+                        total_rows_scanned += row_count
+                        match_count = 0
 
-                    for gantry in target_gantry:
-                        sub_df = df_temp[df_temp[1] == gantry]
-                        match_count += len(sub_df)
-                        vol_sum = sub_df[4].sum()
-                        traffic_dict[gantry] += float(vol_sum)
+                        for gantry in target_gantry:
+                            sub_df = df_temp[df_temp[1] == gantry]
+                            match_count += len(sub_df)
+                            vol_sum = sub_df[4].sum()
+                            traffic_dict[gantry] += float(vol_sum)
 
-                    success_count += 1
-                    debug_logs.append(f"📄 [CSV {hh}:{mm}] 讀取 {row_count} 行，匹配霧峰段門架 {match_count} 次")
-            else:
-                debug_logs.append(f"📄 [CSV {hh}:{mm}] 下載失敗 HTTP {resp.status_code}")
-        except Exception as e:
-            debug_logs.append(f"📄 [CSV {hh}:{mm}] 讀取異常: {e}")
+                        success_count += 1
+                        debug_logs.append(f"📄 [CSV {hh}:{mm}] 讀取 {row_count} 行，匹配霧峰段門架 {match_count} 次")
+                        break
+                else:
+                    if retry == 1:
+                        debug_logs.append(f"📄 [CSV {hh}:{mm}] 下載失敗 HTTP {resp.status_code}")
+            except Exception as e:
+                if retry == 1:
+                    debug_logs.append(f"📄 [CSV {hh}:{mm}] 讀取異常: {e}")
 
     debug_logs.append(f"📊 累計下載成功 {success_count}/12 份 CSV 檔，共掃描 {total_rows_scanned} 行資料。")
 
