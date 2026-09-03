@@ -73,9 +73,10 @@ def fetch_m03a_traffic_from_freeway():
     session.headers.update(headers)
 
     latest_valid_dt = None
-    latest_channel = "直連"
+    latest_channel = None
 
-    for minutes_back in range(10, 40, 5):
+    # 優先測試 Worker 代理，再測試直連
+    for minutes_back in range(10, 45, 5):
         test_dt = now - datetime.timedelta(minutes=minutes_back)
         test_dt = test_dt.replace(minute=(test_dt.minute // 5) * 5, second=0, microsecond=0)
         
@@ -88,37 +89,43 @@ def fetch_m03a_traffic_from_freeway():
         raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd_str}/{hh_str}/TDCS_M03A_{ymd_str}_{hh_str}{mm_str}00.csv"
         proxy_url = f"{CF_PROXY_URL}/?url={raw_url}"
 
+        # 嘗試 Worker 代理
         try:
-            r_direct = session.get(raw_url, timeout=4, verify=False)
-            if r_direct.status_code == 200 and len(r_direct.text) > 500:
-                debug_logs.append(f"-> [直連] HTTP Response Status: 200, Body Length: {len(r_direct.text)} bytes")
-                latest_valid_dt = test_dt
-                latest_channel = "直連"
-                break
-        except Exception:
-            debug_logs.append(f"❌\n[直連] 連線異常: ConnectTimeoutError")
-
-        try:
-            r_proxy = session.get(proxy_url, timeout=4, verify=False)
-            if r_proxy.status_code == 200 and len(r_proxy.text) > 500:
-                debug_logs.append(f"-> [Worker代理] HTTP Response Status: 200, Body Length: {len(r_proxy.text)} bytes")
+            r_proxy = session.get(proxy_url, timeout=5, verify=False)
+            if r_proxy.status_code == 200 and len(r_proxy.text) > 300:
+                debug_logs.append(f"-> [Worker代理] Response 200 OK, Body Length: {len(r_proxy.text)} bytes")
                 latest_valid_dt = test_dt
                 latest_channel = "Worker代理"
                 break
             else:
-                debug_logs.append(f"❌\n[Worker代理] 連線異常: Read timed out.")
+                debug_logs.append(f"❌ [Worker代理] HTTP 狀態碼異常: {r_proxy.status_code}")
+        except Exception as e:
+            debug_logs.append(f"❌ [Worker代理] 連線逾時/失敗: {e}")
+
+        # 嘗試直連
+        try:
+            r_direct = session.get(raw_url, timeout=3, verify=False)
+            if r_direct.status_code == 200 and len(r_direct.text) > 300:
+                debug_logs.append(f"-> [直連] Response 200 OK, Body Length: {len(r_direct.text)} bytes")
+                latest_valid_dt = test_dt
+                latest_channel = "直連"
+                break
         except Exception:
-            debug_logs.append(f"❌\n[Worker代理] 連線異常: Read timed out.")
+            debug_logs.append(f"❌ [直連] 連線 Timeout")
 
+    # 若全數探測失敗，預設回溯 25 分鐘，並強制使用 Worker 代理
     if latest_valid_dt is None:
-        latest_valid_dt = now - datetime.timedelta(minutes=30)
+        latest_valid_dt = now - datetime.timedelta(minutes=25)
         latest_valid_dt = latest_valid_dt.replace(minute=(latest_valid_dt.minute // 5) * 5, second=0, microsecond=0)
+        latest_channel = "Worker代理"
+        debug_logs.append("⚠️ 所有即時探測嘗試均失敗，強制切換至 [Worker代理] 回溯抓取機制。")
 
-    debug_logs.append(f"🎯\n成功定位高公局最新車流 CSV 時間點: {latest_valid_dt.strftime('%Y%m%d %H:%M')} (管道: {latest_channel})")
+    debug_logs.append(f"🎯 成功定位高公局最新車流 CSV 時間點: {latest_valid_dt.strftime('%Y%m%d %H:%M')} (管道: {latest_channel})")
 
     success_count = 0
     total_rows_scanned = 0
 
+    # 依定位點抓取前 1 小時 (12 個 5 分鐘區間) 資料
     for i in range(11, -1, -1):
         slot_dt = latest_valid_dt - datetime.timedelta(minutes=i * 5)
         ymd = slot_dt.strftime("%Y%m%d")
@@ -126,7 +133,7 @@ def fetch_m03a_traffic_from_freeway():
         mm = slot_dt.strftime("%M")
 
         raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-        target_url = proxy_url if latest_channel == "Worker代理" else raw_url
+        target_url = f"{CF_PROXY_URL}/?url={raw_url}" if latest_channel == "Worker代理" else raw_url
 
         try:
             resp = session.get(target_url, timeout=8, verify=False)
@@ -149,20 +156,24 @@ def fetch_m03a_traffic_from_freeway():
                         traffic_dict[gantry] += float(vol_sum)
 
                     success_count += 1
-                    debug_logs.append(f"📄\n[CSV {hh}:{mm}] 讀取 {row_count} 行，匹配霧峰段門架 {match_count} 次")
+                    debug_logs.append(f"📄 [CSV {hh}:{mm}] 讀取 {row_count} 行，匹配霧峰段門架 {match_count} 次")
             else:
-                debug_logs.append(f"📄\n[CSV {hh}:{mm}] 下載失敗 HTTP {resp.status_code}")
+                debug_logs.append(f"📄 [CSV {hh}:{mm}] 下載失敗 HTTP {resp.status_code}")
         except Exception as e:
-            debug_logs.append(f"📄\n[CSV {hh}:{mm}] 讀取異常: {e}")
+            debug_logs.append(f"📄 [CSV {hh}:{mm}] 讀取異常: {e}")
 
     debug_logs.append(f"📊 累計下載成功 {success_count}/12 份 CSV 檔，共掃描 {total_rows_scanned} 行資料。")
-    debug_logs.append(f"🔢 各門架原始實測總量 (車輛數): {traffic_dict}")
 
-    if success_count > 0 and success_count < 12:
+    # 若有成功抓取資料，等比放大還原為單小時車流量；若完全失敗，填入歷史預設基準值
+    if success_count > 0:
         scale_factor = 12.0 / success_count
         for gantry in target_gantry:
             traffic_dict[gantry] = round(traffic_dict[gantry] * scale_factor)
+    else:
+        debug_logs.append("⚠️ 車流 CSV 讀取成功率為 0，載入預設保底車流數值。")
+        traffic_dict = {"03F2100N": 620.0, "03F2100S": 580.0, "03F2125N": 510.0, "03F2129S": 490.0}
 
+    debug_logs.append(f"🔢 各門架計算總量 (輛/小時): {traffic_dict}")
     return traffic_dict, debug_logs
 
 
@@ -244,24 +255,24 @@ def fetch_wufeng_live_features(df_history=None):
             debug_logs.append(
                 f"[2/3] ✅ 成功取得【氣象署霧峰站】 (時間: {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%, 氣壓 {press}hPa"
             )
-    except Exception as e:
+    except Exception:
         obs_time_str = f"{now.strftime('%Y-%m-%d')}T09:00:00+08:00"
-        debug_logs.append(f"[2/3] ✅ 成功取得【氣象署霧峰站】 (時間: {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%, 氣壓 {press}hPa")
+        debug_logs.append(f"[2/3] ⚠️ 採用氣象保底數據 (時間: {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%, 氣壓 {press}hPa")
 
     # (C) 車流量
     traffic_dict, traffic_logs = fetch_m03a_traffic_from_freeway()
     debug_logs.extend(traffic_logs)
 
-    v_2100N = traffic_dict.get("03F2100N", 281.0)
-    v_2100S = traffic_dict.get("03F2100S", 291.0)
-    v_2125N = traffic_dict.get("03F2125N", 336.0)
-    v_2129S = traffic_dict.get("03F2129S", 399.0)
+    v_2100N = traffic_dict.get("03F2100N", 620.0)
+    v_2100S = traffic_dict.get("03F2100S", 580.0)
+    v_2125N = traffic_dict.get("03F2125N", 510.0)
+    v_2129S = traffic_dict.get("03F2129S", 490.0)
 
     debug_logs.append(
         f"[3/3] ✅ 車流計算完成 (等比換算一小時): 2100N={v_2100N:.0f}, 2100S={v_2100S:.0f}, 2125N={v_2125N:.0f}, 2129S={v_2129S:.0f}"
     )
 
-    # (D) 安全地計算差分欄位，避免 KeyError: 'pm25_diff'
+    # (D) 安全計算差分欄位
     last_pm25 = pm25
     last_pm25_diff = 0.0
     if df_history is not None and len(df_history) > 0 and "pm25" in df_history.columns:
